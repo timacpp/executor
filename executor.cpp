@@ -227,13 +227,16 @@ private:
 
         argv[args.size()] = nullptr;
 
-        unix_try(close(stdout_pipe[0]), "close stdout read");
-        unix_try(close(stderr_pipe[0]), "close stderr read");
-
         unix_try(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout");
         unix_try(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr");
 
+        unix_try(close(stdout_pipe[0]), "close stdout read");
+        unix_try(close(stderr_pipe[0]), "close stderr read");
+        unix_try(close(stdout_pipe[1]), "close stdout write");
+        unix_try(close(stderr_pipe[1]), "close stderr read");
+
         unix_try(execvp(program, argv), "execv");
+
         exit(0);
     }
 
