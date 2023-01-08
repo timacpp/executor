@@ -29,7 +29,7 @@ namespace {
     }
 
     template<typename UnixReturnType, typename = is_numeric<UnixReturnType>>
-    void unix_try(UnixReturnType expression_result, std::string&& hint) {
+    void unix_check(UnixReturnType expression_result, std::string&& hint) {
         if ((expression_result) == -1) {
             std::cerr << "Error in " << hint << std::endl;
             std::exit(1);
@@ -190,23 +190,21 @@ private:
     void start_task(task_id id, const std::vector<std::string>& args) {
         int stdout_pipe[2], stderr_pipe[2];
 
-        unix_try(pipe(stdout_pipe), "stdout pipe");
-        unix_try(pipe(stderr_pipe), "stderr pipe");
+        unix_check(pipe(stdout_pipe), "stdout pipe");
+        unix_check(pipe(stderr_pipe), "stderr pipe");
 
         pid_t daemon_pid = create_daemon(args, stdout_pipe, stderr_pipe);
         initialize_task(id, daemon_pid);
 
-        unix_try(close(stdout_pipe[1]), "close stdout write");
-        unix_try(close(stderr_pipe[1]), "close stderr write");
+        unix_check(close(stdout_pipe[1]), "close stdout write");
+        unix_check(close(stderr_pipe[1]), "close stderr write");
 
-        std::atomic<bool> task_active{true};
-        std::thread stdout_reader([&]{ read_daemon_output(id, stdout_pipe[0], STDOUT_FILENO, task_active); });
-        std::thread stderr_reader([&]{ read_daemon_output(id, stderr_pipe[0], STDERR_FILENO, task_active); });
+        std::thread stdout_reader([&]{ read_task_output(id, stdout_pipe[0], STDOUT_FILENO); });
+        std::thread stderr_reader([&]{ read_task_output(id, stderr_pipe[0], STDERR_FILENO); });
 
         int status;
         wait(&status);
 
-        task_active = false;
         stdout_reader.join();
         stderr_reader.join();
 
@@ -215,7 +213,7 @@ private:
 
     pid_t create_daemon(const std::vector<std::string>& args, int stdout_pipe[2], int stderr_pipe[2]) {
         pid_t pid = fork();
-        unix_try(pid, "fork");
+        unix_check(pid, "fork");
 
         if (pid != 0) {
             return pid;
@@ -230,15 +228,15 @@ private:
 
         argv[args.size()] = nullptr;
 
-        unix_try(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout");
-        unix_try(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr");
+        unix_check(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout");
+        unix_check(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr");
 
-        unix_try(close(stdout_pipe[0]), "close stdout read");
-        unix_try(close(stderr_pipe[0]), "close stderr read");
-        unix_try(close(stdout_pipe[1]), "close stdout write");
-        unix_try(close(stderr_pipe[1]), "close stderr read");
+        unix_check(close(stdout_pipe[0]), "close stdout read");
+        unix_check(close(stderr_pipe[0]), "close stderr read");
+        unix_check(close(stdout_pipe[1]), "close stdout write");
+        unix_check(close(stderr_pipe[1]), "close stderr read");
 
-        unix_try(execvp(program, argv), "execv");
+        unix_check(execvp(program, argv), "execv");
 
         exit(0);
     }
@@ -261,31 +259,36 @@ private:
         job_available.notify_one();
     }
 
-    void read_daemon_output(task_id id, int input_fd, int output_fd, const std::atomic<bool>& task_active) {
+    void read_task_output(task_id id, int input_fd, int output_fd) {
         std::string message;
 
-        while (task_active) {
-            char buffer[1];
-            ssize_t bytes_read = read(input_fd, buffer, 1);
+        while (true) {
+            char byte;
+            ssize_t bytes_read = read(input_fd, &byte, 1);
 
-            if (bytes_read > 0 && *buffer != '\n') { // TODO: update message when EOF
-                message += *buffer;
-                continue;
-            }
+            unix_check(bytes_read, "read");
 
             if (bytes_read == 0) {
+                if (!message.empty()) {
+                    update_task_output(id, message, output_fd);
+                }
                 break;
-            }
-
-            std::lock_guard<std::mutex> lock{task_mutex};
-
-            if (output_fd == STDOUT_FILENO) {
-                tasks[id].out = message;
+            } else if (byte == '\n') {
+                update_task_output(id, message, output_fd);
+                message.clear();
             } else {
-                tasks[id].err = message;
+                message += byte;
             }
+        }
+    }
 
-            message.clear();
+    void update_task_output(task_id id, const std::string& message, int output_fd) {
+        std::lock_guard<std::mutex> lock{task_mutex};
+
+        if (output_fd == STDOUT_FILENO) {
+            tasks[id].out = message;
+        } else {
+            tasks[id].err = message;
         }
     }
 
