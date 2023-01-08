@@ -63,16 +63,20 @@ public:
         this->reader = std::move(std::thread([&]{ read_commands(); }));
 
         while (active) {
-            clear_task_results();
-            std::unique_lock<std::mutex> lock{command_mutex};
+            std::unique_lock<std::mutex> lock{job_mutex};
 
-            command_available.wait(lock, [this]{ return !commands.empty(); });  // TODO: do not wait if can clear tasks
+            job_available.wait(lock, [this]{ return !commands.empty() || !results.empty(); });
 
-            Command command = commands.front();
-            commands.pop_front();
-            lock.unlock();
-
-            execute(command);
+            if (!results.empty()) {
+                display_task_results();
+                results.clear();
+                lock.unlock();
+            } else {
+                Command command = commands.front();
+                commands.pop_front();
+                lock.unlock();
+                execute(command);
+            }
         }
     }
 
@@ -83,11 +87,9 @@ private:
     std::atomic<bool> active{true};
 
     std::thread reader;
-    std::mutex command_mutex;
+    std::mutex job_mutex;
+    std::condition_variable job_available;
     std::deque<Command> commands;
-    std::condition_variable command_available;
-
-    std::mutex result_mutex;
     std::vector<TaskResult> results;
 
     std::mutex task_mutex;
@@ -113,9 +115,7 @@ private:
         }
     }
 
-    void clear_task_results() {
-        std::lock_guard<std::mutex> lock{result_mutex};
-
+    void display_task_results() {
         for (TaskResult result : results) {
             if (result.signalled) {
                 std::cout << "Task " << result.id << " ended: signalled.\n";
@@ -123,8 +123,6 @@ private:
                 std::cout << "Task " << result.id << " ended: status " << result.exit_code << ".\n";
             }
         }
-
-        results.clear();
     }
 
     void out(task_id id) {
@@ -252,7 +250,7 @@ private:
     }
 
     void save_task_result(task_id id, int status) {
-        std::lock_guard<std::mutex> lock{result_mutex};
+        std::lock_guard<std::mutex> lock{job_mutex};
 
         if (WIFSIGNALED(status)) {
             results.push_back({id, 0, true});
@@ -260,7 +258,7 @@ private:
             results.push_back({id, WEXITSTATUS(status), false});
         }
 
-        command_available.notify_one();
+        job_available.notify_one();
     }
 
     void read_daemon_output(task_id id, int input_fd, int output_fd, const std::atomic<bool>& task_active) {
@@ -313,9 +311,9 @@ private:
     }
 
     void add_command(Command&& command) {
-        std::lock_guard<std::mutex> lock{command_mutex};
+        std::lock_guard<std::mutex> lock{job_mutex};
         commands.emplace_back(command);
-        command_available.notify_one();
+        job_available.notify_one();
     }
 };
 
