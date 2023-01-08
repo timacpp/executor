@@ -11,12 +11,10 @@
 #include <algorithm>
 #include <sstream>
 
-#include <stdio.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
-#include <fcntl.h>
 
 namespace {
     template<typename T>
@@ -83,16 +81,19 @@ private:
 
     task_id next_task_id = 0;
     std::atomic<bool> active{true};
-    std::deque<Command> commands;
-    std::vector<TaskResult> results;
-    std::unordered_map<task_id, Task> tasks;
 
     std::thread reader;
-    std::mutex task_mutex;
     std::mutex command_mutex;
-    std::mutex results_mutex;
+    std::deque<Command> commands;
     std::condition_variable command_available;
+
+    std::mutex result_mutex;
+    std::vector<TaskResult> results;
+
+    std::mutex task_mutex;
+    std::unordered_map<task_id, Task> tasks;
     std::condition_variable task_available;
+    std::unordered_map<task_id, std::thread> workers;
 
     void execute(Command& command) {
         if (command.name == "run") {
@@ -113,7 +114,7 @@ private:
     }
 
     void clear_task_results() {
-        std::lock_guard<std::mutex> lock{results_mutex};
+        std::lock_guard<std::mutex> lock{result_mutex};
 
         for (TaskResult result : results) {
             if (result.signalled) {
@@ -149,7 +150,7 @@ private:
     void kill(task_id id) {
         do_synchronized(id, [&](const auto& it) {
             if (it != tasks.end()) {
-                ::kill(it->second.pid, SIGINT); // TODO: join the worker thread?
+                ::kill(it->second.pid, SIGINT);
             } else {
                 std::cerr << "Task " << id << " kill: no such task.\n";
             }
@@ -166,19 +167,23 @@ private:
     }
 
     void quit() {
+        active = false;
+        reader.join();
+
         for (auto& [id, _] : tasks) {
             kill(id);
         }
 
-        active = false;
-        reader.join();
+        for (auto& [_, worker] : workers) {
+            worker.join();
+        }
     }
 
     void run(const std::vector<std::string>& args) {
         std::unique_lock<std::mutex> lock{task_mutex};
         const task_id current_task_id = next_task_id++;
 
-        std::thread([&]{ start_task(current_task_id, args); }).detach();
+        workers[current_task_id] = std::move(std::thread([&]{ start_task(current_task_id, args); }));
         task_available.wait(lock, [&]{ return tasks.find(current_task_id) != tasks.end(); });
 
         std::cout << "Task " << current_task_id << " started: pid " << tasks[current_task_id].pid << ".\n";
@@ -247,7 +252,7 @@ private:
     }
 
     void save_task_result(task_id id, int status) {
-        std::lock_guard<std::mutex> lock{results_mutex};
+        std::lock_guard<std::mutex> lock{result_mutex};
 
         if (WIFSIGNALED(status)) {
             results.push_back({id, 0, true});
