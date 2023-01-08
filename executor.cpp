@@ -175,6 +175,8 @@ private:
         for (auto& [_, worker] : workers) {
             worker.join();
         }
+
+        display_task_results();
     }
 
     void run(const std::vector<std::string>& args) {
@@ -296,6 +298,10 @@ private:
         std::string cli_command;
 
         while (cli_command != "quit" && std::getline(std::cin, cli_command)) {
+            if (cli_command.empty()) {
+                continue;
+            }
+
             std::istringstream stream{cli_command};
             Command command;
 
