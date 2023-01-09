@@ -29,9 +29,11 @@ namespace {
     }
 
     template<typename UnixReturnType, typename = is_numeric<UnixReturnType>>
-    void unix_check(UnixReturnType expression_result, std::string&& hint) {
+    void unix_check(UnixReturnType expression_result, std::string&& hint, bool suppress_print = false) {
         if ((expression_result) == -1) {
-            std::cerr << "Error in " << hint << std::endl;
+            if (!suppress_print) {
+                std::cerr << "Error in " << hint << std::endl;
+            }
             std::exit(1);
         }
     }
@@ -110,7 +112,7 @@ private:
     std::mutex task_mutex;
     std::condition_variable task_available;
     std::vector<Task> tasks{MAX_TASKS};
-    std::vector<std::thread> workers{MAX_TASKS};
+    std::vector<std::thread> workers;
 
     void execute(Command&& command) {
         if (command.name == "run") {
@@ -178,7 +180,7 @@ private:
         std::unique_lock<std::mutex> lock{task_mutex};
         const task_id current_task_id = next_task_id++;
 
-        workers[current_task_id] = std::move(std::thread(&Executor::start_task, this, current_task_id, args));
+        workers.emplace_back(&Executor::start_task, this, current_task_id, args);
         task_available.wait(lock, [&]{ return tasks[current_task_id].active; });
 
         std::cout << "Task " << current_task_id << " started: pid " << tasks[current_task_id].pid << ".\n";
@@ -228,15 +230,15 @@ private:
 
         argv[args.size()] = nullptr;
 
-        unix_check(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout");
-        unix_check(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr");
+        unix_check(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout", true);
+        unix_check(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr", true);
 
-        unix_check(close(stdout_pipe[0]), "close stdout read");
-        unix_check(close(stderr_pipe[0]), "close stderr read");
-        unix_check(close(stdout_pipe[1]), "close stdout write");
-        unix_check(close(stderr_pipe[1]), "close stderr read");
+        unix_check(close(stdout_pipe[0]), "close stdout read", true);
+        unix_check(close(stderr_pipe[0]), "close stderr read", true);
+        unix_check(close(stdout_pipe[1]), "close stdout write", true);
+        unix_check(close(stderr_pipe[1]), "close stderr read", true);
 
-        unix_check(execvp(program, argv), "execv");
+        unix_check(execvp(program, argv), "execvp", true);
 
         exit(0);
     }
