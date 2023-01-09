@@ -49,8 +49,16 @@ public:
 
     struct Task {
         pid_t pid;
+        bool active;
         std::string out;
         std::string err;
+        std::mutex mutex;
+
+        Task() : pid{0}, active{false} {}
+
+        Task(Task&& task) noexcept :
+            pid{task.pid}, active{task.active},
+            out{std::move(task.out)}, err{std::move(task.err)} {}
     };
 
     struct TaskResult {
@@ -59,8 +67,14 @@ public:
         bool signalled;
     };
 
+    Executor() {
+        for (task_id id = 0; id < MAX_TASKS; id++) {
+            tasks.emplace_back((Task){});
+        }
+    }
+
     void start() {
-        this->reader = std::move(std::thread([&]{ read_commands(); }));
+        this->reader = std::move(std::thread(&Executor::read_commands, this));
 
         while (active) {
             std::unique_lock<std::mutex> lock{job_mutex};
@@ -75,16 +89,17 @@ public:
                 Command command = commands.front();
                 commands.pop_front();
                 lock.unlock();
-                execute(command);
+                execute(std::move(command));
             }
         }
     }
 
 private:
     static constexpr long MICROS_IN_MILLI = 1000;
+    static constexpr size_t MAX_TASKS = 4096;
 
     task_id next_task_id = 0;
-    std::atomic<bool> active{true};
+    bool active{true};
 
     std::thread reader;
     std::mutex job_mutex;
@@ -93,11 +108,11 @@ private:
     std::vector<TaskResult> results;
 
     std::mutex task_mutex;
-    std::unordered_map<task_id, Task> tasks;
     std::condition_variable task_available;
-    std::unordered_map<task_id, std::thread> workers;
+    std::vector<Task> tasks{MAX_TASKS};
+    std::vector<std::thread> workers{MAX_TASKS};
 
-    void execute(Command& command) {
+    void execute(Command&& command) {
         if (command.name == "run") {
             run(command.args);
         } else if (command.name == "out") {
@@ -126,38 +141,18 @@ private:
     }
 
     void out(task_id id) {
-        do_synchronized(id, [&](const auto& it) {
-            if (it != tasks.end()) {
-                std::cout << "Task " << id << " stdout: '" << it->second.out << "'.\n";
-            } else {
-                std::cerr << "Task " << id << " stdout: no such task.\n";
-            }
-        });
+        std::unique_lock<std::mutex> lock{task_mutex};
+        std::cout << "Task " << id << " stdout: '" << tasks[id].out << "'.\n";
     }
 
     void err(task_id id) {
-        do_synchronized(id, [&](const auto& it) {
-            if (it != tasks.end()) {
-                std::cout << "Task " << id << " stderr: '" << it->second.err << "'.\n";
-            } else {
-                std::cerr << "Task " << id << " stderr: no such task.\n";
-            }
-        });
+        std::unique_lock<std::mutex> lock{task_mutex};
+        std::cout << "Task " << id << " stdout: '" << tasks[id].err << "'.\n";
     }
 
     void kill(task_id id) {
-        do_synchronized(id, [&](const auto& it) {
-            if (it != tasks.end()) {
-                ::kill(it->second.pid, SIGINT);
-            } else {
-                std::cerr << "Task " << id << " kill: no such task.\n";
-            }
-        });
-    }
-
-    void do_synchronized(task_id id, const std::function<void(const decltype(tasks)::const_iterator&)>& action) {
-        std::lock_guard<std::mutex> lock{task_mutex};
-        action(tasks.find(id));
+        std::unique_lock<std::mutex> lock{task_mutex};
+        ::kill(tasks[id].pid, SIGINT);
     }
 
     void sleep(millis_t millis) {
@@ -168,11 +163,11 @@ private:
         active = false;
         reader.join();
 
-        for (auto& [id, _] : tasks) {
+        for (task_id id = 0; id < tasks.size(); id++) {
             kill(id);
         }
 
-        for (auto& [_, worker] : workers) {
+        for (auto& worker : workers) {
             worker.join();
         }
 
@@ -183,8 +178,8 @@ private:
         std::unique_lock<std::mutex> lock{task_mutex};
         const task_id current_task_id = next_task_id++;
 
-        workers[current_task_id] = std::move(std::thread([&]{ start_task(current_task_id, args); }));
-        task_available.wait(lock, [&]{ return tasks.find(current_task_id) != tasks.end(); });
+        workers[current_task_id] = std::move(std::thread(&Executor::start_task, this, current_task_id, args));
+        task_available.wait(lock, [&]{ return tasks[current_task_id].active; });
 
         std::cout << "Task " << current_task_id << " started: pid " << tasks[current_task_id].pid << ".\n";
     }
@@ -196,13 +191,16 @@ private:
         unix_check(pipe(stderr_pipe), "stderr pipe");
 
         pid_t daemon_pid = create_daemon(args, stdout_pipe, stderr_pipe);
-        initialize_task(id, daemon_pid);
+        activate_task(id, daemon_pid);
 
         unix_check(close(stdout_pipe[1]), "close stdout write");
         unix_check(close(stderr_pipe[1]), "close stderr write");
 
-        std::thread stdout_reader([&]{ read_task_output(id, stdout_pipe[0], STDOUT_FILENO); });
-        std::thread stderr_reader([&]{ read_task_output(id, stderr_pipe[0], STDERR_FILENO); });
+        int stdout_input = stdout_pipe[0];
+        std::thread stdout_reader(&Executor::read_task_output, this, id, stdout_input, STDOUT_FILENO);
+
+        int stderr_input = stderr_pipe[0];
+        std::thread stderr_reader(&Executor::read_task_output, this, id, stderr_input, STDERR_FILENO);
 
         int status;
         wait(&status);
@@ -243,9 +241,10 @@ private:
         exit(0);
     }
 
-    void initialize_task(task_id id, pid_t pid) {
+    void activate_task(task_id id, pid_t pid) {
         std::lock_guard<std::mutex> lock{task_mutex};
-        tasks[id] = {pid, "", ""};
+        tasks[id].active = true;
+        tasks[id].pid = pid;
         task_available.notify_one();
     }
 
