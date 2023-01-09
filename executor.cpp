@@ -149,7 +149,7 @@ private:
 
     void err(task_id id) {
         std::unique_lock<std::mutex> lock{task_mutex};
-        std::cout << "Task " << id << " stdout: '" << tasks[id].err << "'.\n";
+        std::cout << "Task " << id << " stderr: '" << tasks[id].err << "'.\n";
     }
 
     void kill(task_id id) {
@@ -166,7 +166,9 @@ private:
         reader.join();
 
         for (task_id id = 0; id < tasks.size(); id++) {
-            kill(id);
+            if (tasks[id].active) {
+                kill(id);
+            }
         }
 
         for (auto& worker : workers) {
