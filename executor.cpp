@@ -210,8 +210,8 @@ private:
         stdout_reader.join();
         stderr_reader.join();
 
-        unix_check(close(stdout_pipe[0]), "close stdout write");
-        unix_check(close(stderr_pipe[0]), "close stderr write");
+        unix_check(close(stdout_pipe[0]), "close stdout read");
+        unix_check(close(stderr_pipe[0]), "close stderr read");
 
         save_task_result(id, status);
     }
