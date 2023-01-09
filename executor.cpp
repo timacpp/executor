@@ -2,7 +2,6 @@
 #include <vector>
 #include <unordered_map>
 
-#include <atomic>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -98,18 +97,18 @@ public:
 
 private:
     static constexpr long MICROS_IN_MILLI = 1000;
-    static constexpr size_t MAX_TASKS = 4096;
+    static constexpr size_t MAX_TASKS = 4096 + 7;
 
-    task_id next_task_id = 0;
-    bool active{true};
-
+    bool active = true;
     std::thread reader;
     std::mutex job_mutex;
     std::condition_variable job_available;
     std::deque<Command> commands;
     std::vector<TaskResult> results;
 
-    std::mutex task_mutex;
+    std::mutex run_mutex;
+    task_id next_task_id = 0;
+    pid_t current_daemon_pid = 0;
     std::condition_variable task_available;
     std::vector<Task> tasks{MAX_TASKS};
     std::vector<std::thread> workers;
@@ -128,33 +127,35 @@ private:
         } else if (command.name == "quit") {
             quit();
         } else {
-            std::cerr << "Unknown command: " << command.name << "\n";
+            std::cerr << "Unknown command: " << command.name << std::endl;
         }
     }
 
     void display_task_results() {
         for (TaskResult result : results) {
             if (result.signalled) {
-                std::cout << "Task " << result.id << " ended: signalled.\n";
+                std::cout << "Task " << result.id << " ended: signalled." << std::endl;
             } else {
-                std::cout << "Task " << result.id << " ended: status " << result.exit_code << ".\n";
+                std::cout << "Task " << result.id << " ended: status " << result.exit_code << "." << std::endl;
             }
         }
     }
 
     void out(task_id id) {
-        std::unique_lock<std::mutex> lock{task_mutex};
-        std::cout << "Task " << id << " stdout: '" << tasks[id].out << "'.\n";
+        std::lock_guard<std::mutex> lock{tasks[id].mutex};
+        std::cout << "Task " << id << " stdout: '" << tasks[id].out << "'." << std::endl;
     }
 
     void err(task_id id) {
-        std::unique_lock<std::mutex> lock{task_mutex};
-        std::cout << "Task " << id << " stderr: '" << tasks[id].err << "'.\n";
+        std::lock_guard<std::mutex> lock{tasks[id].mutex};
+        std::cout << "Task " << id << " stderr: '" << tasks[id].err << "'." << std::endl;
     }
 
-    void kill(task_id id) {
-        std::unique_lock<std::mutex> lock{task_mutex};
-        ::kill(tasks[id].pid, SIGINT);
+    void kill(task_id id, int signal = SIGINT) {
+        std::lock_guard<std::mutex> lock{tasks[id].mutex};
+        if (tasks[id].active) {
+            ::kill(tasks[id].pid, signal);
+        }
     }
 
     void sleep(millis_t millis) {
@@ -166,9 +167,7 @@ private:
         reader.join();
 
         for (task_id id = 0; id < tasks.size(); id++) {
-            if (tasks[id].active) {
-                kill(id);
-            }
+            kill(id, SIGKILL);
         }
 
         for (auto& worker : workers) {
@@ -179,13 +178,14 @@ private:
     }
 
     void run(const std::vector<std::string>& args) {
-        std::unique_lock<std::mutex> lock{task_mutex};
-        const task_id current_task_id = next_task_id++;
+        set_current_daemon_pid(0, false);
 
-        workers.emplace_back(&Executor::start_task, this, current_task_id, args);
-        task_available.wait(lock, [&]{ return tasks[current_task_id].active; });
+        std::unique_lock<std::mutex> lock{run_mutex};
+        workers.emplace_back(&Executor::start_task, this, next_task_id, args);
+        task_available.wait(lock, [&]{ return current_daemon_pid != 0; });
 
-        std::cout << "Task " << current_task_id << " started: pid " << tasks[current_task_id].pid << ".\n";
+        std::cout << "Task " << next_task_id << " started: pid " << current_daemon_pid << "." << std::endl;
+        next_task_id++;
     }
 
     void start_task(task_id id, const std::vector<std::string>& args) {
@@ -196,18 +196,15 @@ private:
 
         pid_t daemon_pid = create_daemon(args, stdout_pipe, stderr_pipe);
         activate_task(id, daemon_pid);
+        set_current_daemon_pid(daemon_pid, true);
 
         unix_check(close(stdout_pipe[1]), "close stdout write");
         unix_check(close(stderr_pipe[1]), "close stderr write");
 
-        int stdout_input = stdout_pipe[0];
-        std::thread stdout_reader(&Executor::read_task_output, this, id, stdout_input, STDOUT_FILENO);
-
-        int stderr_input = stderr_pipe[0];
-        std::thread stderr_reader(&Executor::read_task_output, this, id, stderr_input, STDERR_FILENO);
+        auto [stdout_reader, stderr_reader] = create_pipe_readers(id, stdout_pipe[0], stderr_pipe[0]);
 
         int status;
-        wait(&status);
+        waitpid(daemon_pid, &status, 0);
 
         stdout_reader.join();
         stderr_reader.join();
@@ -245,18 +242,33 @@ private:
         exit(0);
     }
 
+    std::pair<std::thread, std::thread> create_pipe_readers(task_id id, int stdout_input, int stderr_input) {
+        std::lock_guard<std::mutex> lock{job_mutex};
+        return {
+            std::thread(&Executor::read_task_output, this, id, stdout_input, STDOUT_FILENO),
+            std::thread(&Executor::read_task_output, this, id, stderr_input, STDERR_FILENO)
+        };
+    }
+
     void activate_task(task_id id, pid_t pid) {
-        std::lock_guard<std::mutex> lock{task_mutex};
+        std::unique_lock<std::mutex> lock{tasks[id].mutex};
         tasks[id].active = true;
         tasks[id].pid = pid;
-        task_available.notify_one();
+    }
+
+    void set_current_daemon_pid(pid_t pid, bool notify) {
+        std::unique_lock<std::mutex> lock{run_mutex};
+        current_daemon_pid = pid;
+        if (notify) {
+            task_available.notify_one();
+        }
     }
 
     void save_task_result(task_id id, int status) {
         std::lock_guard<std::mutex> lock{job_mutex};
 
         if (WIFSIGNALED(status)) {
-            results.push_back({id, 0, true});
+            results.push_back({id, WEXITSTATUS(status), true});
         } else {
             results.push_back({id, WEXITSTATUS(status), false});
         }
@@ -271,7 +283,7 @@ private:
             char byte;
             ssize_t bytes_read = read(input_fd, &byte, 1);
 
-            unix_check(bytes_read, "read");
+            unix_check(bytes_read, "read", true);
 
             if (bytes_read == 0) {
                 if (!message.empty()) {
@@ -288,7 +300,7 @@ private:
     }
 
     void update_task_output(task_id id, const std::string& message, int output_fd) {
-        std::lock_guard<std::mutex> lock{task_mutex};
+        std::lock_guard<std::mutex> lock{tasks[id].mutex};
 
         if (output_fd == STDOUT_FILENO) {
             tasks[id].out = message;
