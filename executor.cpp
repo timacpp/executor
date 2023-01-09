@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <sstream>
 
+#include <fcntl.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -191,8 +192,8 @@ private:
     void start_task(task_id id, const std::vector<std::string>& args) {
         int stdout_pipe[2], stderr_pipe[2];
 
-        unix_check(pipe(stdout_pipe), "stdout pipe");
-        unix_check(pipe(stderr_pipe), "stderr pipe");
+        unix_check(pipe2(stdout_pipe, O_CLOEXEC), "stdout pipe");
+        unix_check(pipe2(stderr_pipe, O_CLOEXEC), "stderr pipe");
 
         pid_t daemon_pid = create_daemon(args, stdout_pipe, stderr_pipe);
         activate_task(id, daemon_pid);
@@ -209,6 +210,9 @@ private:
         stdout_reader.join();
         stderr_reader.join();
 
+        unix_check(close(stdout_pipe[0]), "close stdout write");
+        unix_check(close(stderr_pipe[0]), "close stderr write");
+
         save_task_result(id, status);
     }
 
@@ -220,6 +224,14 @@ private:
             return pid;
         }
 
+        unix_check(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout", true);
+        unix_check(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr", true);
+
+        unix_check(close(stdout_pipe[0]), "close stdout read", true);
+        unix_check(close(stderr_pipe[0]), "close stderr read", true);
+        unix_check(close(stdout_pipe[1]), "close stdout write", true);
+        unix_check(close(stderr_pipe[1]), "close stderr write", true);
+
         const char* program = args[0].c_str();
         char* argv[args.size() + 1];
 
@@ -229,16 +241,7 @@ private:
 
         argv[args.size()] = nullptr;
 
-        unix_check(dup2(stdout_pipe[1], STDOUT_FILENO), "dup2 stdout", true);
-        unix_check(dup2(stderr_pipe[1], STDERR_FILENO), "dup2 stderr", true);
-
-        unix_check(close(stdout_pipe[0]), "close stdout read", true);
-        unix_check(close(stderr_pipe[0]), "close stderr read", true);
-        unix_check(close(stdout_pipe[1]), "close stdout write", true);
-        unix_check(close(stderr_pipe[1]), "close stderr read", true);
-
         unix_check(execvp(program, argv), "execvp", true);
-
         exit(0);
     }
 
